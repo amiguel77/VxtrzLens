@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vxtrz Lens</title>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<style>
+  :root { --bg:#0e0d12; --fg:#eee8f5; --accent:#ffe2ec; --muted:#8d869c; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--fg); font-family: ui-monospace, Menlo, Consolas, monospace;
+         display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 12px; }
+  canvas { width: min(100%, 960px); aspect-ratio: 16/9; background: #000; border: 2px solid #2a2733; display: none; }
+  #start { background: var(--accent); color: #1a1100; border: 0; padding: 14px 26px; font: inherit; font-weight: 700; font-size: 1rem; cursor: pointer; }
+  #start:focus-visible, #start:hover { outline: 3px solid var(--fg); }
+  #msg { color: var(--muted); font-size: .85rem; text-align: center; max-width: 60ch; line-height: 1.5; }
+  #keys { color: var(--muted); font-size: .8rem; display: none; }
+</style>
+</head>
+<body>
+<button id="start">Start camera</button>
+<canvas id="out" width="960" height="540"></canvas>
+<div id="keys">N / P: filter &nbsp; C: mode &nbsp; S: save PNG &nbsp; Q: quit</div>
+
+<script>
+"use strict";
+const CFG = { W: 960, H: 540, pinchPx: 45, filterCooldown: 0.15, modeCooldown: 1.2, fistPx: 80 };
+const $ = id => document.getElementById(id);
+const out = $("out"), ctx = out.getContext("2d");
+const base = document.createElement("canvas"); base.width = CFG.W; base.height = CFG.H;
+const bctx = base.getContext("2d");
+const video = document.createElement("video"); video.playsInline = true; video.muted = true;
+
+const clamp = v => v < 0 ? 0 : v > 255 ? 255 : v;
+const toCanvas = img => { const c = document.createElement("canvas"); c.width = img.width; c.height = img.height; c.getContext("2d").putImageData(img, 0, 0); return c; };
+const blurImg = (img, sigma) => {
+  const c = document.createElement("canvas"); c.width = img.width; c.height = img.height;
+  const x = c.getContext("2d"); x.filter = `blur(${sigma}px)`; x.drawImage(toCanvas(img), 0, 0);
+  return x.getImageData(0, 0, img.width, img.height);
+};
+const grayArr = img => { const d = img.data, n = d.length / 4, g = new Float32Array(n);
+  for (let i = 0; i < n; i++) g[i] = 0.299 * d[4*i] + 0.587 * d[4*i+1] + 0.114 * d[4*i+2]; return g; };
+const fromGray = (g, w, h, f) => { const o = new ImageData(w, h);
+  for (let i = 0; i < g.length; i++) { const c = f(g[i]); o.data[4*i] = c[0]; o.data[4*i+1] = c[1]; o.data[4*i+2] = c[2]; o.data[4*i+3] = 255; } return o; };
+const jet = v => { v /= 255; return [clamp(255 * (1.5 - Math.abs(4*v - 3))), clamp(255 * (1.5 - Math.abs(4*v - 2))), clamp(255 * (1.5 - Math.abs(4*v - 1)))]; };
+const hueRGB = v => { const h = v / 255 * 6, i = Math.floor(h) % 6, f = h - Math.floor(h), q = 255 * (1 - f), t = 255 * f;
+  return [[255,t,0],[q,255,0],[0,255,t],[0,q,255],[t,0,255],[255,0,q]][i]; };
+
+const FILTERS = {
+  "dual-tone": img => fromGray(grayArr(img), img.width, img.height, g => g > 110 ? [255,140,10] : [220,30,180]),
+  "thermal": img => fromGray(grayArr(img), img.width, img.height, g => jet(g)),
+  "sketch": img => {
+    const w = img.width, h = img.height, g = grayArr(img);
+    const inv = fromGray(g, w, h, v => { const k = 255 - v; return [k,k,k]; });
+    const b = blurImg(inv, 3.5).data, o = new ImageData(w, h);
+    for (let i = 0; i < g.length; i++) { const d = 255 - b[4*i]; const v = d <= 0 ? 0 : clamp(g[i] * 256 / d);
+      o.data[4*i] = o.data[4*i+1] = o.data[4*i+2] = v; o.data[4*i+3] = 255; }
+    return o;
+  },
+  "pixelate": img => {
+    const w = img.width, h = img.height; if (w < 2 || h < 2) return img;
+    const s = document.createElement("canvas"); s.width = Math.max(1, Math.floor(w / 14)); s.height = Math.max(1, Math.floor(h / 14));
+    s.getContext("2d").drawImage(toCanvas(img), 0, 0, s.width, s.height);
+    const c = document.createElement("canvas"); c.width = w; c.height = h;
+    const x = c.getContext("2d"); x.imageSmoothingEnabled = false; x.drawImage(s, 0, 0, w, h);
+    return x.getImageData(0, 0, w, h);
+  },
+  "glitch": img => {
+    const w = img.width, h = img.height; if (w < 2 || h < 2) return img;
+    const s = 4 + Math.floor(Math.random() * 9), o = new ImageData(w, h), d = img.data, p = o.data;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = 4 * (y * w + x), xr = (x - s + w * 4) % w, xb = (x + s) % w;
+      p[i] = d[4 * (y * w + xr)]; p[i+1] = d[i+1]; p[i+2] = d[4 * (y * w + xb) + 2]; p[i+3] = 255;
+    }
+    for (let k = 0; k < 2; k++) { const y = Math.floor(Math.random() * h);
+      for (let x = 0; x < w; x++) { const i = 4 * (y * w + x); p[i] = Math.random() * 255; p[i+1] = Math.random() * 255; p[i+2] = Math.random() * 255; } }
+    return o;
+  },
+  "invert": img => { const o = new ImageData(img.width, img.height), d = img.data;
+    for (let i = 0; i < d.length; i += 4) { o.data[i] = 255 - d[i]; o.data[i+1] = 255 - d[i+1]; o.data[i+2] = 255 - d[i+2]; o.data[i+3] = 255; } return o; },
+  "red-channel": img => { const o = new ImageData(img.width, img.height), d = img.data;
+    for (let i = 0; i < d.length; i += 4) { o.data[i] = d[i]; o.data[i+3] = 255; } return o; },
+  "edge": img => {
+    const w = img.width, h = img.height, g = grayArr(blurImg(img, 1.2)), o = new ImageData(w, h);
+    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const gx = -g[i-w-1] + g[i-w+1] - 2*g[i-1] + 2*g[i+1] - g[i+w-1] + g[i+w+1];
+      const gy = -g[i-w-1] - 2*g[i-w] - g[i-w+1] + g[i+w-1] + 2*g[i+w] + g[i+w+1];
+      if (Math.hypot(gx, gy) > 150) { o.data[4*i] = 255; o.data[4*i+1] = 255; o.data[4*i+2] = 102; }
+    }
+    for (let i = 3; i < o.data.length; i += 4) o.data[i] = 255;
+    return o;
+  },
+  "blur": img => blurImg(img, 4.1),
+  "cartoon": img => {
+    const w = img.width, h = img.height, g = grayArr(img), m = grayArr(blurImg(img, 2.2));
+    const sm = blurImg(img, 1.5).data, o = new ImageData(w, h);
+    for (let i = 0; i < g.length; i++) {
+      const line = g[i] > m[i] - 9;
+      for (let c = 0; c < 3; c++) o.data[4*i+c] = line ? Math.round(sm[4*i+c] / 32) * 32 : 0;
+      o.data[4*i+3] = 255;
+    }
+    return o;
+  },
+  "rainbow-wave": img => {
+    const w = img.width, h = img.height, t = performance.now() / 1000 * 5, o = new ImageData(w, h), d = img.data;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = 4 * (y * w + x), c = hueRGB(Math.floor(Math.sin((x + y) * 0.05 + t) * 127 + 128));
+      o.data[i] = 0.3 * d[i] + 0.7 * c[0]; o.data[i+1] = 0.3 * d[i+1] + 0.7 * c[1]; o.data[i+2] = 0.3 * d[i+2] + 0.7 * c[2]; o.data[i+3] = 255;
+    }
+    return o;
+  },
+};
+const KEYS = Object.keys(FILTERS);
+
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+const isFist = lm => {
+  const wx = lm[0].x * CFG.W, wy = lm[0].y * CFG.H;
+  const ds = [8, 12, 16, 20].map(t => Math.hypot(lm[t].x * CFG.W - wx, lm[t].y * CFG.H - wy));
+  return ds.reduce((a, b) => a + b, 0) / ds.length < CFG.fistPx;
+};
+const isRotated = (thumb, index) => { const dx = index[0] - thumb[0], dy = index[1] - thumb[1]; return dy > 25 || Math.abs(dx) > Math.abs(dy) * 1.1; };
+const sortQuad = (pts, bowtie) => {
+  const xs = [...pts].sort((a, b) => a[0] - b[0]);
+  const l = xs.slice(0, 2).sort((a, b) => a[1] - b[1]), r = xs.slice(2).sort((a, b) => a[1] - b[1]);
+  return bowtie ? [l[0], r[1], r[0], l[1]] : [l[0], r[0], r[1], l[1]];
+};
+
+const S = { idx: 0, mode3d: false, lastSwitch: 0, lastMode: 0, running: false, stream: null };
+const cycle = step => { S.idx = (S.idx + step + KEYS.length) % KEYS.length; };
+
+function renderPortal(pts, key) {
+  const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+  const x = Math.max(0, Math.floor(Math.min(...xs))), y = Math.max(0, Math.floor(Math.min(...ys)));
+  const w = Math.min(Math.ceil(Math.max(...xs)), CFG.W) - x, h = Math.min(Math.ceil(Math.max(...ys)), CFG.H) - y;
+  if (w <= 10 || h <= 10) return;
+  const roi = ctx.getImageData(x, y, w, h);
+  const processed = toCanvas(FILTERS[key](roi));
+  ctx.save();
+  ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.closePath();
+  ctx.clip(); ctx.drawImage(processed, x, y); ctx.restore();
+  ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.closePath();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+}
+
+const CONN = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+function drawHand(lm) {
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 2;
+  CONN.forEach(([a, b]) => { ctx.beginPath(); ctx.moveTo(lm[a].x * CFG.W, lm[a].y * CFG.H); ctx.lineTo(lm[b].x * CFG.W, lm[b].y * CFG.H); ctx.stroke(); });
+  ctx.fillStyle = "#ff3355"; lm.forEach(p => { ctx.beginPath(); ctx.arc(p.x * CFG.W, p.y * CFG.H, 3, 0, 6.3); ctx.fill(); });
+}
+
+function onResults(res) {
+  ctx.drawImage(base, 0, 0);
+  const now = performance.now() / 1000, hands = res.multiHandLandmarks || [], tips = [];
+  let fists = 0, bowtie = false;
+
+  if (hands.length) {
+    for (const lm of hands) {
+      drawHand(lm);
+      const t = [4, 8, 12, 16, 20].map(i => [Math.floor(lm[i].x * CFG.W), Math.floor(lm[i].y * CFG.H)]);
+      tips.push(t);
+      if (dist(t[0], t[4]) < CFG.pinchPx && now - S.lastSwitch > CFG.filterCooldown) { cycle(1); S.lastSwitch = now; }
+      if (isFist(lm)) fists++;
+    }
+    if (fists === 2 && now - S.lastMode > CFG.modeCooldown) { S.mode3d = !S.mode3d; S.lastMode = now; }
+
+    const cur = KEYS[S.idx], sec = KEYS[(S.idx + 1) % KEYS.length];
+    if (S.mode3d) {
+      if (tips.length === 2) {
+        const [a, b] = tips;
+        renderPortal([a[0], a[1], a[2], b[2], b[1], b[0]], cur);
+        renderPortal([a[2], a[3], a[4], b[4], b[3], b[2]], sec);
+      } else if (tips.length === 1) renderPortal(tips[0], cur);
+    } else if (tips.length === 2) {
+      const c = [tips[0][0], tips[0][1], tips[1][0], tips[1][1]];
+      bowtie = isRotated(c[0], c[1]) || isRotated(c[2], c[3]);
+      renderPortal(sortQuad(c, bowtie), cur);
+    } else if (tips.length === 1) {
+      const t = tips[0]; renderPortal([t[0], t[1], t[2], t[4]], cur);
+    }
+  }
+
+  ctx.font = "bold 15px ui-monospace, Menlo, Consolas, monospace";
+  ctx.fillStyle = "#00ffff";
+  ctx.fillText(`MODE: ${S.mode3d ? "3D Mesh" : bowtie ? "2D Bowtie" : "2D Quad"} [Key 'C' / Dual Fist]`, 15, 25);
+  ctx.fillStyle = "#fff";
+  ctx.fillText(`FILTER: ${KEYS[S.idx].toUpperCase()} [Pinch / Key 'N'/'P']`, 15, 50);
+}
+
+let detector;
+async function loop() {
+  if (!S.running) return;
+  if (video.readyState >= 2) {
+    bctx.save(); bctx.scale(-1, 1); bctx.drawImage(video, -CFG.W, 0, CFG.W, CFG.H); bctx.restore();
+    await detector.send({ image: base });
+  }
+  requestAnimationFrame(loop);
+}
+
+async function start() {
+  const msg = $("msg"); $("start").disabled = true; msg.textContent = "Requesting camera and loading hand model…";
+  try {
+    S.stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 }, audio: false });
+    video.srcObject = S.stream; await video.play();
+    detector = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}` });
+    detector.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.8, minTrackingConfidence: 0.8 });
+    detector.onResults(onResults);
+    await detector.initialize();
+    $("start").style.display = "none"; out.style.display = "block"; $("keys").style.display = "block"; msg.textContent = "";
+    S.running = true; loop();
+  } catch (e) {
+    $("start").disabled = false;
+    msg.textContent = e && e.name === "NotAllowedError" ? "Camera access was blocked. Allow it in the browser's site settings and try again."
+      : e && e.name === "NotFoundError" ? "No camera detected." : "Could not start: " + (e && e.message || e);
+  }
+}
+
+function stop() {
+  S.running = false; if (S.stream) S.stream.getTracks().forEach(t => t.stop());
+  out.style.display = "none"; $("keys").style.display = "none";
+  $("start").style.display = ""; $("start").disabled = false; $("msg").textContent = "Camera stopped.";
+}
+
+$("start").addEventListener("click", start);
+addEventListener("keydown", e => {
+  if (!S.running) return;
+  const k = e.key.toLowerCase();
+  if (k === "q") stop();
+  else if (k === "c") S.mode3d = !S.mode3d;
+  else if (k === "n") cycle(1);
+  else if (k === "p") cycle(-1);
+  else if (k === "s") { const a = document.createElement("a"); a.download = `cap_${Math.floor(Date.now() / 1000)}.png`; a.href = out.toDataURL("image/png"); a.click(); }
+});
+</script>
+</body>
+</html>
