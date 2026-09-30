@@ -1,4 +1,4 @@
-# 📼 Retro Lens
+# Retro Lens
 
 **Your hands are the viewfinder.** Frame a piece of the world with your fingers and watch it turn into thermal vision, a glitchy mess, or a pencil sketch. It runs in your browser, with no install and no server.
 
